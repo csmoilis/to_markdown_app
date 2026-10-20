@@ -1,0 +1,37 @@
+# dependencies and build output
+node_modules/
+.vercel/
+.output/
+dist/
+.tanstack/
+.nitro/
+*.tsbuildinfo
+
+# local tooling folders (keep only the app env file the dev script reads)
+.grok/*
+!.grok/app-env.json
+artifacts/
+screenshots/
+
+# your documents and converted results: never commit them
+*.pdf
+*.ppt
+*.pptx
+*.pptm
+*.ppsx
+*.potx
+*.md
+!README.md
+output/
+outputs/
+
+# env and secrets
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
