@@ -15,13 +15,34 @@ import {
 import type { Deck, DeckBlock, DeckSlide, TextLine } from "@/lib/pptx/types";
 import { plainLine } from "@/lib/pptx/xml";
 import { cn } from "@/lib/utils";
-import { Copy, Download, FileUp, RotateCcw, Trash2, Undo2, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Copy, Download, FileUp, RotateCcw, Trash2, Undo2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 const MAX_BYTES = 30 * 1024 * 1024;
 const INDENT = ["pl-0", "pl-4", "pl-8", "pl-12", "pl-16"] as const;
 
 type View = "reading" | "markdown";
+
+/** Scroll `container` (not the window) just enough to show `child`. */
+function revealInside(container: HTMLElement, child: HTMLElement) {
+  const box = container.getBoundingClientRect();
+  const item = child.getBoundingClientRect();
+  if (item.top < box.top) container.scrollTop -= box.top - item.top + 8;
+  else if (item.bottom > box.bottom) container.scrollTop += item.bottom - box.bottom + 8;
+  if (item.left < box.left) container.scrollLeft -= box.left - item.left + 8;
+  else if (item.right > box.right) container.scrollLeft += item.right - box.right + 8;
+}
+
+/** True when a key press belongs to a text field, select, or editable element. */
+function isTyping(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  if (target instanceof HTMLInputElement) {
+    return !["checkbox", "radio", "button", "submit", "reset", "file"].includes(target.type);
+  }
+  return false;
+}
 type Scope = "slide" | "deck";
 
 function LineView({ line }: { line: TextLine }) {
@@ -175,6 +196,9 @@ function Reading({ slide, unit }: { slide: DeckSlide; unit: "slide" | "page" }) 
 export function FolioApp() {
   const inputRef = useRef<HTMLInputElement>(null);
   const resultRef = useRef<HTMLElement>(null);
+  const navRef = useRef<HTMLElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const panelsRef = useRef<HTMLDivElement>(null);
   const runRef = useRef(0);
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -295,6 +319,51 @@ export function FolioApp() {
     resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [finished]);
 
+  const activeIndex = slide?.index;
+  // New page/slide: start its preview at the top and keep its sidebar item in view.
+  useEffect(() => {
+    if (activeIndex === undefined) return;
+    if (previewRef.current) previewRef.current.scrollTop = 0;
+    const nav = navRef.current;
+    const item = nav?.querySelector<HTMLElement>(`[data-section="${activeIndex}"]`);
+    if (nav && item) revealInside(nav, item);
+  }, [activeIndex]);
+
+  function goTo(index: number) {
+    if (!deck || !deck.slides.length) return;
+    const next = Math.max(0, Math.min(deck.slides.length - 1, index));
+    setActive(next);
+    // Keep the sidebar + preview on screen (no-op when they already are). On wide screens the results
+    // section is exactly one viewport tall, so this only moves the page when it was scrolled away.
+    const panels = panelsRef.current;
+    if (panels && window.matchMedia("(min-width: 48rem)").matches) {
+      const box = panels.getBoundingClientRect();
+      if (box.top < -1 || box.bottom > window.innerHeight + 1) resultRef.current?.scrollIntoView({ block: "start" });
+    }
+  }
+
+  const activePosition = deck ? Math.min(active, Math.max(0, deck.slides.length - 1)) : 0;
+  const slideTotal = deck?.slides.length ?? 0;
+
+  useEffect(() => {
+    if (!slideTotal) return;
+    function onKey(event: KeyboardEvent) {
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (isTyping(event.target)) return;
+      const back = event.key === "ArrowLeft" || event.key === "ArrowUp";
+      const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+      if (!back && !forward) return;
+      // Up/Down inside the preview keep scrolling the preview text.
+      if ((event.key === "ArrowUp" || event.key === "ArrowDown") && previewRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      event.preventDefault();
+      setActive((current) => Math.max(0, Math.min(slideTotal - 1, current + (forward ? 1 : -1))));
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [slideTotal]);
+
   function copyMarkdown() {
     if (!copyText) return;
     void navigator.clipboard.writeText(copyText).then(() => {
@@ -411,7 +480,7 @@ export function FolioApp() {
         ) : null}
 
         {deck && slide ? (
-          <section ref={resultRef} className="mt-8">
+          <section ref={resultRef} className="mt-8 md:flex md:h-dvh md:flex-col md:py-4">
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div>
                 <h2 className="font-display text-2xl tracking-tight">{deck.fileName}</h2>
@@ -457,8 +526,16 @@ export function FolioApp() {
               </div>
             </div>
 
-            <div className="mt-6 grid gap-6 md:grid-cols-[13rem_minmax(0,1fr)]">
-              <nav aria-label={Noun === "Page" ? "Pages" : "Slides"} className="flex gap-2 overflow-x-auto md:flex-col md:overflow-visible">
+            <div
+              ref={panelsRef}
+              className="mt-6 grid gap-4 md:mt-4 md:min-h-0 md:flex-1 md:grid-cols-[14rem_minmax(0,1fr)] md:gap-6"
+            >
+              <nav
+                ref={navRef}
+                aria-label={Noun === "Page" ? "Pages" : "Slides"}
+                data-testid="sidebar"
+                className="sticky top-0 z-10 -mx-1 flex gap-2 overflow-x-auto bg-background px-1 py-2 md:static md:mx-0 md:min-h-0 md:flex-col md:overflow-y-auto md:overflow-x-hidden md:rounded-2xl md:border md:border-border md:p-2"
+              >
                 {deck.slides.map((item, index) => {
                   const selected = index === active;
                   const isRemoved = removed.has(item.index);
@@ -469,7 +546,7 @@ export function FolioApp() {
                       data-section={item.index}
                       data-removed={isRemoved ? "true" : undefined}
                       className={cn(
-                        "flex min-h-11 w-52 shrink-0 items-stretch overflow-hidden rounded-lg border md:w-full",
+                        "flex min-h-11 w-52 shrink-0 scroll-m-2 items-stretch overflow-hidden rounded-lg border md:w-full",
                         selected
                           ? "border-primary bg-primary text-primary-foreground"
                           : "border-border bg-card text-foreground",
@@ -489,7 +566,7 @@ export function FolioApp() {
                       ) : null}
                       <button
                         type="button"
-                        onClick={() => setActive(index)}
+                        onClick={() => goTo(index)}
                         aria-current={selected ? "true" : undefined}
                         className="min-w-0 flex-1 px-3 py-2 text-left"
                       >
@@ -525,7 +602,38 @@ export function FolioApp() {
                 })}
               </nav>
 
-              <div className="min-w-0 rounded-4xl border border-border bg-card p-6 md:p-8">
+              <div
+                ref={previewRef}
+                data-testid="preview"
+                className="min-w-0 rounded-4xl border border-border bg-card p-6 md:min-h-0 md:overflow-y-auto md:p-8"
+              >
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <Button
+                    variant="secondary"
+                    className="min-h-9 px-3"
+                    disabled={activePosition === 0}
+                    onClick={() => goTo(activePosition - 1)}
+                    aria-label={`Previous ${noun}`}
+                    title={`Previous ${noun} (← or ↑)`}
+                  >
+                    <ChevronLeft className="size-4" aria-hidden="true" />
+                    Previous
+                  </Button>
+                  <p className="text-sm tabular-nums text-muted-foreground" data-testid="position">
+                    {Noun} {activePosition + 1} of {slideTotal}
+                  </p>
+                  <Button
+                    variant="secondary"
+                    className="min-h-9 px-3"
+                    disabled={activePosition >= slideTotal - 1}
+                    onClick={() => goTo(activePosition + 1)}
+                    aria-label={`Next ${noun}`}
+                    title={`Next ${noun} (→ or ↓)`}
+                  >
+                    Next
+                    <ChevronRight className="size-4" aria-hidden="true" />
+                  </Button>
+                </div>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex gap-2">
                     <Button variant={view === "reading" ? "primary" : "ghost"} onClick={() => setView("reading")}>
