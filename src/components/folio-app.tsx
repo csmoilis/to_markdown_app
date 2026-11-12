@@ -3,16 +3,46 @@ import { extractDeck } from "@/lib/pptx/extract";
 import { looksLikePdf } from "@/lib/pptx/pdf";
 import { deckToMarkdown, downloadName, slideToMarkdown } from "@/lib/pptx/markdown";
 import { buildSampleFile } from "@/lib/pptx/sample";
+import {
+  emptySelection,
+  removeSection,
+  restoreAll,
+  restoreSection,
+  toggleSection,
+  undo,
+  type Selection,
+} from "@/lib/pptx/selection";
 import type { Deck, DeckBlock, DeckSlide, TextLine } from "@/lib/pptx/types";
 import { plainLine } from "@/lib/pptx/xml";
 import { cn } from "@/lib/utils";
-import { Copy, Download, FileUp } from "lucide-react";
+import { ChevronLeft, ChevronRight, Copy, Download, FileUp, RotateCcw, Trash2, Undo2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 const MAX_BYTES = 30 * 1024 * 1024;
 const INDENT = ["pl-0", "pl-4", "pl-8", "pl-12", "pl-16"] as const;
 
 type View = "reading" | "markdown";
+
+/** Scroll `container` (not the window) just enough to show `child`. */
+function revealInside(container: HTMLElement, child: HTMLElement) {
+  const box = container.getBoundingClientRect();
+  const item = child.getBoundingClientRect();
+  if (item.top < box.top) container.scrollTop -= box.top - item.top + 8;
+  else if (item.bottom > box.bottom) container.scrollTop += item.bottom - box.bottom + 8;
+  if (item.left < box.left) container.scrollLeft -= box.left - item.left + 8;
+  else if (item.right > box.right) container.scrollLeft += item.right - box.right + 8;
+}
+
+/** True when a key press belongs to a text field, select, or editable element. */
+function isTyping(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  if (target instanceof HTMLInputElement) {
+    return !["checkbox", "radio", "button", "submit", "reset", "file"].includes(target.type);
+  }
+  return false;
+}
 type Scope = "slide" | "deck";
 
 function LineView({ line }: { line: TextLine }) {
@@ -166,6 +196,9 @@ function Reading({ slide, unit }: { slide: DeckSlide; unit: "slide" | "page" }) 
 export function FolioApp() {
   const inputRef = useRef<HTMLInputElement>(null);
   const resultRef = useRef<HTMLElement>(null);
+  const navRef = useRef<HTMLElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const panelsRef = useRef<HTMLDivElement>(null);
   const runRef = useRef(0);
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -179,6 +212,7 @@ export function FolioApp() {
   const [scope, setScope] = useState<Scope>("deck");
   const [copied, setCopied] = useState(false);
   const [readImages, setReadImages] = useState(true);
+  const [selection, setSelection] = useState<Selection>(emptySelection);
 
   async function runBuffer(buffer: ArrayBuffer, fileName: string, unit: "slide" | "page") {
     const run = ++runRef.current;
@@ -188,6 +222,7 @@ export function FolioApp() {
     setDone(0);
     setTotal(0);
     setActive(0);
+    setSelection(emptySelection);
     setView("reading");
     setStatus("Opening deck");
     try {
@@ -246,11 +281,19 @@ export function FolioApp() {
   }
 
   const slide = deck?.slides[Math.min(active, Math.max(0, (deck?.slides.length ?? 1) - 1))];
+  const removed = selection.removed;
+  const slideRemoved = Boolean(slide && removed.has(slide.index));
+  const sectionCount = deck?.slides.length ?? 0;
+  const keptCount = deck ? deck.slides.filter((item) => !removed.has(item.index)).length : 0;
   const markdown = deck
     ? scope === "slide" && slide
       ? slideToMarkdown(slide, deck.unit)
-      : deckToMarkdown(deck)
+      : deckToMarkdown(deck, removed)
     : "";
+  // What Copy markdown puts on the clipboard: never a removed section, never an empty export.
+  const copyText = !deck || keptCount === 0 || (scope === "slide" && slideRemoved) ? "" : markdown;
+  // Removing sections is offered once reading has stopped (finished, or stopped early).
+  const editable = Boolean(deck) && !busy;
   const noun = deck?.unit === "page" ? "page" : "slide";
   const nounPlural = deck?.unit === "page" ? "pages" : "slides";
   const Noun = deck?.unit === "page" ? "Page" : "Slide";
@@ -266,7 +309,7 @@ export function FolioApp() {
     : 0;
   const finished = Boolean(deck) && !busy && !error && pendingImages === 0;
   const statusText = finished
-    ? `Done. ${deck?.slides.length ?? 0} ${(deck?.slides.length ?? 0) === 1 ? noun : nounPlural} are ready. Use Copy markdown or Download .md.`
+    ? `Done. ${deck?.slides.length ?? 0} ${(deck?.slides.length ?? 0) === 1 ? noun : nounPlural} are ready. Untick or press × on any you don't need, then use Copy markdown or Download .md.`
     : !busy && deck && pendingImages > 0
       ? `Stopped early. ${pendingImages} ${pendingImages === 1 ? "image was" : "images were"} not read. The text already found is below.`
       : status;
@@ -276,17 +319,62 @@ export function FolioApp() {
     resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [finished]);
 
+  const activeIndex = slide?.index;
+  // New page/slide: start its preview at the top and keep its sidebar item in view.
+  useEffect(() => {
+    if (activeIndex === undefined) return;
+    if (previewRef.current) previewRef.current.scrollTop = 0;
+    const nav = navRef.current;
+    const item = nav?.querySelector<HTMLElement>(`[data-section="${activeIndex}"]`);
+    if (nav && item) revealInside(nav, item);
+  }, [activeIndex]);
+
+  function goTo(index: number) {
+    if (!deck || !deck.slides.length) return;
+    const next = Math.max(0, Math.min(deck.slides.length - 1, index));
+    setActive(next);
+    // Keep the sidebar + preview on screen (no-op when they already are). On wide screens the results
+    // section is exactly one viewport tall, so this only moves the page when it was scrolled away.
+    const panels = panelsRef.current;
+    if (panels && window.matchMedia("(min-width: 48rem)").matches) {
+      const box = panels.getBoundingClientRect();
+      if (box.top < -1 || box.bottom > window.innerHeight + 1) resultRef.current?.scrollIntoView({ block: "start" });
+    }
+  }
+
+  const activePosition = deck ? Math.min(active, Math.max(0, deck.slides.length - 1)) : 0;
+  const slideTotal = deck?.slides.length ?? 0;
+
+  useEffect(() => {
+    if (!slideTotal) return;
+    function onKey(event: KeyboardEvent) {
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (isTyping(event.target)) return;
+      const back = event.key === "ArrowLeft" || event.key === "ArrowUp";
+      const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+      if (!back && !forward) return;
+      // Up/Down inside the preview keep scrolling the preview text.
+      if ((event.key === "ArrowUp" || event.key === "ArrowDown") && previewRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      event.preventDefault();
+      setActive((current) => Math.max(0, Math.min(slideTotal - 1, current + (forward ? 1 : -1))));
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [slideTotal]);
+
   function copyMarkdown() {
-    if (!markdown) return;
-    void navigator.clipboard.writeText(markdown).then(() => {
+    if (!copyText) return;
+    void navigator.clipboard.writeText(copyText).then(() => {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
     });
   }
 
   function downloadMarkdown() {
-    if (!deck) return;
-    const blob = new Blob([deckToMarkdown(deck)], { type: "text/markdown;charset=utf-8" });
+    if (!deck || keptCount === 0) return;
+    const blob = new Blob([deckToMarkdown(deck, removed)], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -392,7 +480,7 @@ export function FolioApp() {
         ) : null}
 
         {deck && slide ? (
-          <section ref={resultRef} className="mt-8">
+          <section ref={resultRef} className="mt-8 md:flex md:h-dvh md:flex-col md:py-4">
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div>
                 <h2 className="font-display text-2xl tracking-tight">{deck.fileName}</h2>
@@ -400,43 +488,152 @@ export function FolioApp() {
                   {deck.slides.length} {deck.slides.length === 1 ? noun : nounPlural}
                   {imageCount ? ` · ${imageCount} ${imageCount === 1 ? "image" : "images"}` : ""}
                 </p>
+                {editable ? (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-medium tabular-nums" aria-live="polite" data-testid="keep-count">
+                      Keeping {keptCount} of {sectionCount} {sectionCount === 1 ? noun : nounPlural}
+                    </p>
+                    <Button
+                      variant="ghost"
+                      className="min-h-9 px-3"
+                      disabled={selection.history.length === 0}
+                      onClick={() => setSelection((current) => undo(current))}
+                    >
+                      <Undo2 className="size-4" aria-hidden="true" />
+                      Undo
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="min-h-9 px-3"
+                      disabled={removed.size === 0}
+                      onClick={() => setSelection((current) => restoreAll(current))}
+                    >
+                      <RotateCcw className="size-4" aria-hidden="true" />
+                      Restore all
+                    </Button>
+                  </div>
+                ) : null}
               </div>
               <div className="flex flex-col gap-3 sm:flex-row">
-                <Button variant="secondary" onClick={copyMarkdown}>
+                <Button variant="secondary" onClick={copyMarkdown} disabled={!copyText}>
                   <Copy className="size-4" aria-hidden="true" />
                   {copied ? "Copied" : "Copy markdown"}
                 </Button>
-                <Button onClick={downloadMarkdown} disabled={busy}>
+                <Button onClick={downloadMarkdown} disabled={busy || keptCount === 0}>
                   <Download className="size-4" aria-hidden="true" />
                   Download .md
                 </Button>
               </div>
             </div>
 
-            <div className="mt-6 grid gap-6 md:grid-cols-[13rem_minmax(0,1fr)]">
-              <nav aria-label={Noun === "Page" ? "Pages" : "Slides"} className="flex gap-2 overflow-x-auto md:flex-col md:overflow-visible">
+            <div
+              ref={panelsRef}
+              className="mt-6 grid gap-4 md:mt-4 md:min-h-0 md:flex-1 md:grid-cols-[14rem_minmax(0,1fr)] md:gap-6"
+            >
+              <nav
+                ref={navRef}
+                aria-label={Noun === "Page" ? "Pages" : "Slides"}
+                data-testid="sidebar"
+                className="sticky top-0 z-10 -mx-1 flex gap-2 overflow-x-auto bg-background px-1 py-2 md:static md:mx-0 md:min-h-0 md:flex-col md:overflow-y-auto md:overflow-x-hidden md:rounded-2xl md:border md:border-border md:p-2"
+              >
                 {deck.slides.map((item, index) => {
                   const selected = index === active;
+                  const isRemoved = removed.has(item.index);
+                  const name = `${Noun} ${item.index}`;
                   return (
-                    <button
+                    <div
                       key={item.index}
-                      type="button"
-                      onClick={() => setActive(index)}
+                      data-section={item.index}
+                      data-removed={isRemoved ? "true" : undefined}
                       className={cn(
-                        "min-h-11 w-44 shrink-0 rounded-lg border px-3 py-2 text-left md:w-full",
+                        "flex min-h-11 w-52 shrink-0 scroll-m-2 items-stretch overflow-hidden rounded-lg border md:w-full",
                         selected
                           ? "border-primary bg-primary text-primary-foreground"
                           : "border-border bg-card text-foreground",
+                        isRemoved && !selected ? "border-dashed opacity-60" : "",
                       )}
                     >
-                      <span className="block text-xs font-medium tabular-nums">{Noun} {item.index}</span>
-                      <span className="block truncate text-sm">{item.title || "Untitled"}</span>
-                    </button>
+                      {editable ? (
+                        <label className="flex shrink-0 cursor-pointer items-center pl-3" title={isRemoved ? `Keep ${name}` : `Remove ${name}`}>
+                          <input
+                            type="checkbox"
+                            className="size-4 accent-current"
+                            checked={!isRemoved}
+                            aria-label={`Keep ${name} in the markdown`}
+                            onChange={() => setSelection((current) => toggleSection(current, item.index))}
+                          />
+                        </label>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => goTo(index)}
+                        aria-current={selected ? "true" : undefined}
+                        className="min-w-0 flex-1 px-3 py-2 text-left"
+                      >
+                        <span className="block text-xs font-medium tabular-nums">
+                          {name}
+                          {isRemoved ? " · removed" : ""}
+                        </span>
+                        <span className={cn("block truncate text-sm", isRemoved ? "line-through" : "")}>
+                          {item.title || "Untitled"}
+                        </span>
+                      </button>
+                      {editable ? (
+                        <button
+                          type="button"
+                          className="flex w-10 shrink-0 items-center justify-center hover:opacity-70 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
+                          aria-label={isRemoved ? `Restore ${name}` : `Remove ${name}`}
+                          title={isRemoved ? `Restore ${name}` : `Remove ${name}`}
+                          onClick={() =>
+                            setSelection((current) =>
+                              isRemoved ? restoreSection(current, item.index) : removeSection(current, item.index),
+                            )
+                          }
+                        >
+                          {isRemoved ? (
+                            <RotateCcw className="size-4" aria-hidden="true" />
+                          ) : (
+                            <X className="size-4" aria-hidden="true" />
+                          )}
+                        </button>
+                      ) : null}
+                    </div>
                   );
                 })}
               </nav>
 
-              <div className="min-w-0 rounded-4xl border border-border bg-card p-6 md:p-8">
+              <div
+                ref={previewRef}
+                data-testid="preview"
+                className="min-w-0 rounded-4xl border border-border bg-card p-6 md:min-h-0 md:overflow-y-auto md:p-8"
+              >
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <Button
+                    variant="secondary"
+                    className="min-h-9 px-3"
+                    disabled={activePosition === 0}
+                    onClick={() => goTo(activePosition - 1)}
+                    aria-label={`Previous ${noun}`}
+                    title={`Previous ${noun} (← or ↑)`}
+                  >
+                    <ChevronLeft className="size-4" aria-hidden="true" />
+                    Previous
+                  </Button>
+                  <p className="text-sm tabular-nums text-muted-foreground" data-testid="position">
+                    {Noun} {activePosition + 1} of {slideTotal}
+                  </p>
+                  <Button
+                    variant="secondary"
+                    className="min-h-9 px-3"
+                    disabled={activePosition >= slideTotal - 1}
+                    onClick={() => goTo(activePosition + 1)}
+                    aria-label={`Next ${noun}`}
+                    title={`Next ${noun} (→ or ↓)`}
+                  >
+                    Next
+                    <ChevronRight className="size-4" aria-hidden="true" />
+                  </Button>
+                </div>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex gap-2">
                     <Button variant={view === "reading" ? "primary" : "ghost"} onClick={() => setView("reading")}>
@@ -457,6 +654,39 @@ export function FolioApp() {
                     </div>
                   ) : null}
                 </div>
+                {editable ? (
+                  <div
+                    className={cn(
+                      "mt-4 flex flex-col gap-3 rounded-lg border px-4 py-3 sm:flex-row sm:items-center sm:justify-between",
+                      slideRemoved ? "border-dashed border-border bg-secondary" : "border-transparent px-0 py-0",
+                    )}
+                  >
+                    <p className="text-sm text-muted-foreground">
+                      {slideRemoved
+                        ? `${Noun} ${slide.index} is removed. It is left out of the preview, Copy markdown and Download .md.`
+                        : ""}
+                    </p>
+                    {slideRemoved ? (
+                      <Button
+                        variant="secondary"
+                        className="min-h-9"
+                        onClick={() => setSelection((current) => restoreSection(current, slide.index))}
+                      >
+                        <RotateCcw className="size-4" aria-hidden="true" />
+                        Restore {noun}
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="ghost"
+                        className="min-h-9"
+                        onClick={() => setSelection((current) => removeSection(current, slide.index))}
+                      >
+                        <Trash2 className="size-4" aria-hidden="true" />
+                        Remove this {noun}
+                      </Button>
+                    )}
+                  </div>
+                ) : null}
                 <div className="mt-6">
                   {view === "reading" ? (
                     <Reading slide={slide} unit={deck.unit} />
