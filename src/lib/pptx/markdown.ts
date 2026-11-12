@@ -108,9 +108,21 @@ export function slideToMarkdown(slide: DeckSlide, unit: "slide" | "page" = "slid
   return `${parts.join("\n").replace(/\n{3,}/g, "\n\n").trim()}\n`;
 }
 
-export function deckToMarkdown(deck: Deck): string {
+/** Slides/pages still kept for export, i.e. not in `removed` (a set of `slide.index` values). */
+export function keptSlides(deck: Deck, removed?: ReadonlySet<number>): DeckSlide[] {
+  if (!removed || removed.size === 0) return deck.slides;
+  return deck.slides.filter((slide) => !removed.has(slide.index));
+}
+
+/**
+ * Whole-file markdown. Sections whose `slide.index` is in `removed` are left out, so the preview,
+ * Copy markdown and Download .md only contain what the user kept.
+ */
+export function deckToMarkdown(deck: Deck, removed?: ReadonlySet<number>): string {
   const title = deck.fileName.replace(/\.(pptx|pptm|ppsx|potx|ppt|pdf)$/i, "") || "Document";
-  const body = deck.slides.map((slide) => slideToMarkdown(slide, deck.unit)).join("\n");
+  const body = keptSlides(deck, removed)
+    .map((slide) => slideToMarkdown(slide, deck.unit))
+    .join("\n");
   return `# ${title}\n\n${body}`;
 }
 

@@ -22,6 +22,7 @@ npm run dev
 
 Then open <http://localhost:8080>, drop a `.pptx` or `.pdf` file on the page (30 MB max), and use **Copy markdown** or **Download .md** once it finishes.
 
+- **Remove sections you don't need**: when reading finishes, each slide or page in the list has a checkbox and a × button (and the main view has **Remove this slide/page**). Removed sections are left out of the Markdown preview, **Copy markdown** and **Download .md**. The header shows **Keeping N of M**, with **Undo** and **Restore all** if you change your mind.
 - **Read text inside images**: on by default. Turn it off to get only the slide or page text, which takes a few seconds even for long decks.
 - If `npm run dev` prints `spawn vite ENOENT`, run `npm install` again in this folder.
 
